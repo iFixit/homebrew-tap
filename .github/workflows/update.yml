@@ -1,0 +1,68 @@
+name: Update iFixit formula
+on:
+  repository_dispatch:
+    types: [ifixit-release]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: update-ifixit-formula
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the latest published stable release
+        run: |
+          tag=$(gh api repos/iFixit/ifixit-cli/releases/latest --jq .tag_name)
+          export RELEASE_TAG="$tag"
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch(r'v\d+\.\d+\.\d+', os.environ['RELEASE_TAG']):
+              raise SystemExit('Expected a stable release tag')
+          PY
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          gh release download "$tag" --repo iFixit/ifixit-cli --dir artifacts \
+            --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
+          for archive in artifacts/*.tar.gz; do
+            gh attestation verify "$archive" --repo iFixit/ifixit-cli
+          done
+      - name: Generate and check the formula
+        run: |
+          python3 scripts/test-formula.py
+          python3 scripts/update-formula.py "${RELEASE_TAG#v}" artifacts
+          ruby -c Formula/ifixit.rb
+      - name: Open a formula update PR
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if git diff --quiet -- Formula/ifixit.rb; then exit 0; fi
+          branch="update-ifixit-$RELEASE_TAG"
+          # Repeated dispatches must not replay a pending update.
+          if gh pr list --repo "$REPOSITORY" --head "$branch" --json number --jq 'length' | grep -q '^1$'; then
+            exit 0
+          fi
+          git switch -c "$branch"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/ifixit.rb
+          git commit -m "Update iFixit to $RELEASE_TAG"
+          # Supply credentials only to this push, without persisting them in checkout config.
+          gh auth setup-git
+          git push --set-upstream origin "$branch"
+          printf 'Update the formula to the latest published stable release. All four archive checksums and GitHub attestations were verified.\n\nQA\n- Formula generator tests\n- Ruby syntax\n- Native installation tests run separately through workflow_dispatch\n' > "$RUNNER_TEMP/pr.md"
+          gh pr create --repo "$REPOSITORY" --base main --head "$branch" \
+            --title "Update iFixit to $RELEASE_TAG" --body-file "$RUNNER_TEMP/pr.md"
+          # GITHUB_TOKEN does not trigger PR workflows; explicitly dispatch native tests.
+          gh workflow run test.yml --repo "$REPOSITORY" --ref "$branch"
