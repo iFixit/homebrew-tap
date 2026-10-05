@@ -1,0 +1,58 @@
+name: Formula tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: formula-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  formula:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      IFIXIT_NO_WELCOME: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Homebrew/actions/setup-homebrew@dc7099b3e807f1e2ecc61f3ecabc840eedd5586a
+        with:
+          stable: true
+      - name: Check formula generation and Ruby syntax
+        run: |
+          python3 scripts/test-formula.py
+          ruby -c Formula/ifixit.rb
+          brew style Formula/ifixit.rb
+      - name: Install, test, and upgrade the complete archive
+        shell: bash
+        run: |
+          formula="$(brew --repository ifixit/tap)/Formula/ifixit.rb"
+          cp "$formula" "$RUNNER_TEMP/ifixit.rb"
+          # Install an older formula version of the same archive to exercise upgrade.
+          python3 - "$formula" <<'PY'
+          import pathlib, re, sys
+          path = pathlib.Path(sys.argv[1])
+          path.write_text(re.sub(r'^  version ".*"$', '  version "0.0.0"', path.read_text(), flags=re.M))
+          PY
+          brew install ifixit/tap/ifixit
+          brew test ifixit/tap/ifixit
+          cp "$RUNNER_TEMP/ifixit.rb" "$formula"
+          brew upgrade ifixit/tap/ifixit
+          brew test ifixit/tap/ifixit
+          keg="$(brew --prefix ifixit)"
+          test -L "$(brew --prefix)/bin/ifixit"
+          chmod -R a-w "$keg"
+          trap 'chmod -R u+w "$keg"' EXIT
+          brew test ifixit/tap/ifixit
+          "$keg/bin/ifixit" --help
+          test -f "$(brew --prefix)/etc/bash_completion.d/ifixit"
+          test -f "$(brew --prefix)/share/zsh/site-functions/_ifixit"
